@@ -12,8 +12,8 @@ use biliup::downloader::live::LiveStream;
 use core::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use struct_patch::Patch;
 use tracing::{error, info};
+use struct_patch::Patch;
 
 /// 应用程序上下文，包含工作器和扩展信息
 #[derive(Debug, Clone)]
@@ -24,6 +24,8 @@ pub struct Context {
     stream: LiveStream,
     streamer_info: StreamerInfo,
     pool: ConnectionPool,
+    /// 下载的直播间封面本地路径（由封面下载任务填充）
+    downloaded_cover_path: Arc<RwLock<Option<PathBuf>>>,
 }
 
 impl Context {
@@ -40,6 +42,7 @@ impl Context {
             stream,
             streamer_info,
             pool,
+            downloaded_cover_path: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -103,6 +106,18 @@ impl Context {
 
     pub fn streamer_info(&self) -> &StreamerInfo {
         &self.streamer_info
+    }
+
+    /// 设置下载的直播间封面本地路径
+    pub fn set_downloaded_cover_path(&self, path: Option<PathBuf>) {
+        if let Ok(mut guard) = self.downloaded_cover_path.write() {
+            *guard = path;
+        }
+    }
+
+    /// 获取下载的直播间封面本地路径
+    pub fn downloaded_cover_path(&self) -> Option<PathBuf> {
+        self.downloaded_cover_path.read().ok()?.clone()
     }
 
     pub fn download_config(&self, stream: &LiveStream) -> DownloadConfig {

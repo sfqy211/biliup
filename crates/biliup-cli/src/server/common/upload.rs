@@ -73,6 +73,7 @@ where
             &upload_context.bilibili,
             uploaded_videos.videos,
             &recorder,
+            ctx.downloaded_cover_path().map(|p| p.to_string_lossy().into_owned()),
         )
         .await?;
         let submit_api = ctx.config().submit_api.clone();
@@ -270,13 +271,22 @@ pub(crate) async fn build_studio(
     bilibili: &BiliBili,
     videos: Vec<Video>,
     recorder: &Recorder,
+    downloaded_cover_path: Option<String>,
 ) -> AppResult<Studio> {
+    // 封面回退逻辑：手动配置 > 下载的直播间封面
+    let cover = upload_config
+        .cover_path
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or(downloaded_cover_path)
+        .unwrap_or_default();
+
     // 使用 Builder 模式简化构建
     let mut studio: Studio = Studio::builder()
         .desc(recorder.format(&upload_config.description.clone().unwrap_or_default()))
         .maybe_dtime(upload_config.dtime)
         .maybe_copyright(upload_config.copyright)
-        .cover(upload_config.cover_path.clone().unwrap_or_default())
+        .cover(cover)
         .dynamic(upload_config.dynamic.clone().unwrap_or_default())
         .source(
             upload_config

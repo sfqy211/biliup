@@ -328,14 +328,17 @@ pub async fn start_download_workflow(
             .use_live_cover
             .map(|u| u && !live_cover_url.is_empty())
             .unwrap_or(false);
+        let ctx = ctx.clone();
         async move {
-            cover_downloader::download_cover_with(
+            let result = cover_downloader::download_cover_with(
                 &live_cover_url,
                 enabled,
                 &format_filename,
                 client,
             )
-            .await
+            .await;
+            // 将封面下载结果存储到 Context，供后续投稿时使用
+            ctx.set_downloaded_cover_path(result);
         }
     });
 

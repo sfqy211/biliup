@@ -587,7 +587,7 @@ pub async fn post_uploads(
                     "",
                 ),
             );
-            let studio = build_studio(&upload_config, &bilibili, videos, &recorder).await?;
+            let studio = build_studio(&upload_config, &bilibili, videos, &recorder, None).await?;
             let response_data =
                 submit_to_bilibili(&bilibili, &studio, submit_api.as_deref()).await?;
             info!("通过页面上传成功 {:?}", response_data);
