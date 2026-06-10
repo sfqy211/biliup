@@ -17,9 +17,10 @@
 </div>
 
 ## 🛠️ 功能
-* 开箱即用，多种安装方式，提供可视化WebUi界面
-* 多主播录制/上传，24X7无人值守运行，高自定义元信息
-* 边录边传不落盘急速上传，节省本地硬盘空间
+* 提供 skill，让你的 Agent 成为 up 主: `npx skills add biliup/biliup`
+* 开箱即用，多种安装方式，提供可视化 WebUi 界面
+* 多主播录制/上传，24X7 无人值守运行，高自定义元信息
+* 作为自动化流程中的命令行工具封装使用
 
 论坛：[BBS](https://bbs.biliup.rs)
 
@@ -56,6 +57,8 @@ Commands:
   upload    上传视频
   append    是否要对某稿件追加视频
   show      打印视频详情
+  comments  查看视频评论
+  reply     回复视频评论，默认只打印将要回复的内容
   dump-flv  输出flv元数据
   download  下载视频
   server    启动web服务，默认端口19159
@@ -76,10 +79,11 @@ Options:
 Usage: biliup server [OPTIONS]
 
 Options:
-  -b, --bind <BIND>  Specify bind address [default: 0.0.0.0]
-  -p, --port <PORT>  Port to use [default: 19159]
-      --auth         开启登录密码认证
-  -h, --help         Print help
+  -b, --bind <BIND>    Specify bind address [default: 0.0.0.0]
+  -p, --port <PORT>    Port to use [default: 19159]
+      --auth           开启登录密码认证
+  -c, --config <FILE>  使用 biliup 1.0.7 风格配置文件启动录制
+  -h, --help           Print help
 ```
 
 - [使用文档 »](https://docs.biliup.rs)
@@ -108,55 +112,56 @@ Options:
 
 ### 架构概览
 
-Rust后端 + Python引擎 + Next.js前端的混合架构。
+Rust后端 + 精简 Python 包 + Next.js前端的混合架构。
 
 ```mermaid
 graph TB
     subgraph "🌐 前端层"
         UI[Next.js Web界面<br/>React + TypeScript<br/>Semi UI组件库]
     end
-    
+
     subgraph "⚡ Rust后端服务"
-        CLI[Web API服务器<br/>biliup-cli<br/>用户认证 & REST API]
-        CORE[核心上传库<br/>biliup<br/>Bilibili API客户端]
-        GEARS[Python绑定<br/>stream-gears<br/>性能优化桥接]
+        CLI[命令行与 Web API<br/>biliup-cli<br/>REST API / WebUI / 配置导入]
+        CORE[核心库<br/>biliup<br/>直播解析 / 下载 / 上传]
+        DANMAKU[弹幕库<br/>danmaku<br/>多平台协议 / XML输出]
+        GEARS[Python绑定<br/>stream-gears<br/>python -m biliup 入口]
     end
-    
-    subgraph "🐍 Python引擎"
-        ENGINE[下载引擎<br/>biliup<br/>任务调度 & 流处理]
-        PLUGINS[插件系统<br/>20+平台支持<br/>斗鱼/虎牙/Twitch等]
-        DANMAKU[弹幕系统<br/>实时弹幕获取<br/>多平台协议支持]
+
+    subgraph "🐍 Python包"
+        PYENTRY[最小入口<br/>biliup.__main__<br/>调用 stream_gears.main_loop]
+        PYUPLOAD[投稿库<br/>bili_webup / bili_webup_sync<br/>供外部项目调用]
     end
-    
+
     subgraph "🗄️ 数据层"
         DB[(SQLite数据库<br/>配置存储<br/>任务状态 & 日志)]
-        FILES[文件系统<br/>临时视频存储<br/>缓存管理]
+        FILES[文件系统<br/>视频分段 / 弹幕XML<br/>缓存与临时文件]
     end
-    
+
     subgraph "🌍 外部服务"
         BILI[Bilibili API<br/>视频上传服务]
-        STREAMS[直播平台<br/>斗鱼/虎牙/B站等<br/>实时流媒体]
+        STREAMS[直播平台<br/>B站/斗鱼/虎牙/抖音/Twitch等]
     end
-    
+
     UI --> CLI
     CLI --> CORE
-    CLI --> ENGINE
+    CLI --> DANMAKU
     CLI --> DB
-    GEARS --> ENGINE
-    ENGINE --> PLUGINS
-    ENGINE --> DANMAKU
-    ENGINE --> FILES
+    CLI --> FILES
+    CORE --> STREAMS
     CORE --> BILI
-    PLUGINS --> STREAMS
     DANMAKU --> STREAMS
-    
+    DANMAKU --> FILES
+    GEARS --> CLI
+    PYENTRY --> GEARS
+    PYUPLOAD --> BILI
+
     style UI fill:#e1f5fe
     style CLI fill:#f3e5f5
     style CORE fill:#f3e5f5
+    style DANMAKU fill:#f3e5f5
     style GEARS fill:#f3e5f5
-    style ENGINE fill:#e8f5e8
-    style PLUGINS fill:#e8f5e8
-    style DANMAKU fill:#e8f5e8
+    style PYENTRY fill:#e8f5e8
+    style PYUPLOAD fill:#e8f5e8
     style DB fill:#fff3e0
     style FILES fill:#fff3e0
     style BILI fill:#ffebee
