@@ -1,4 +1,5 @@
 use crate::server::common::download::DownloadTask;
+use crate::server::common::recording_policy::Rejection;
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::downloader::DownloadConfig;
@@ -136,12 +137,16 @@ impl Context {
             // 流URL
             url: stream.raw_stream_url.to_string(),
             segment_time: config.segment_time,
+            time_range: self.live_streamer().time_range.clone(),
             file_size: config.file_size,
             headers: stream.stream_headers.clone(),
             recorder: self.recorder(stream_info),
             // output_dir: PathBuf::from("./downloads")
             output_dir: PathBuf::from("."),
             suffix,
+            bytes_written: Default::default(),
+            preview: Default::default(),
+            index_tap: None,
         }
     }
 }
@@ -161,6 +166,11 @@ pub struct Worker {
     config: Arc<RwLock<Config>>,
     /// HTTP客户端
     pub client: StatelessClient,
+    /// 最近一次开播探测被录制策略挡下的原因，仅用于向界面解释「为什么没在录」。
+    ///
+    /// 不参与任何控制流。只存需要流信息才能判定的结论（如标题命中排除关键词）；
+    /// 探测前就能判定的条件（如录制时间范围）由接口侧按当前时钟实时算，不会过期。
+    last_rejection: RwLock<Option<Rejection>>,
 }
 
 impl Worker {
@@ -184,11 +194,22 @@ impl Worker {
             upload_streamer,
             config,
             client,
+            last_rejection: RwLock::new(None),
         }
     }
 
     pub fn id(&self) -> i64 {
         self.live_streamer.id
+    }
+
+    /// 记录本轮开播探测的策略判定结果（`None` 表示未被挡下）。
+    pub fn set_rejection(&self, rejection: Option<Rejection>) {
+        *self.last_rejection.write().unwrap() = rejection;
+    }
+
+    /// 最近一次探测被挡下的原因。
+    pub fn rejection(&self) -> Option<Rejection> {
+        self.last_rejection.read().unwrap().clone()
     }
 
     /// 获取主播信息
@@ -299,5 +320,64 @@ impl fmt::Debug for WorkerStatus {
             WorkerStatus::Pause => "Pause",
         };
         f.write_str(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::config::ConfigPatch;
+    use crate::server::core::downloader::DownloaderType;
+    use crate::server::core::downloader::sync_downloader::align_file_size;
+
+    fn streamer_with_override(override_cfg: Option<ConfigPatch>) -> LiveStreamer {
+        LiveStreamer {
+            id: 1,
+            url: "https://live.bilibili.com/1".into(),
+            remark: "test".into(),
+            filename_prefix: None,
+            time_range: None,
+            upload_streamers_id: None,
+            format: None,
+            override_cfg,
+            preprocessor: None,
+            segment_processor: None,
+            downloaded_processor: None,
+            postprocessor: None,
+            opt_args: None,
+            excluded_keywords: None,
+        }
+    }
+
+    /// 复现：全局 file_size=100MB，主播覆写只选了 sync-downloader，
+    /// 覆写经落库回传后 worker 取到的配置必须仍是 100MB，边录边传按 100MiB 切段。
+    #[test]
+    fn worker_config_keeps_global_file_size_when_override_never_set_it() {
+        let global_size = 104_857_600u64;
+        let config = Arc::new(RwLock::new(Config {
+            file_size: Some(global_size),
+            ..Config::default()
+        }));
+        // 与 WebUI 保存后的路径一致：反序列化 -> 落库序列化 -> 再反序列化
+        let submitted: ConfigPatch =
+            serde_json::from_str(r#"{"downloader":"sync-downloader"}"#).unwrap();
+        let stored = serde_json::to_string(&submitted).unwrap();
+        let loaded: ConfigPatch = serde_json::from_str(&stored).unwrap();
+
+        let worker = Worker::new(
+            streamer_with_override(Some(loaded)),
+            None,
+            config,
+            StatelessClient::default(),
+        );
+        let effective = worker.get_config();
+
+        assert_eq!(effective.downloader, Some(DownloaderType::SyncDownloader));
+        assert_eq!(effective.file_size, Some(global_size));
+        assert_eq!(
+            align_file_size(effective.file_size),
+            100 * 1024 * 1024,
+            "边录边传应按全局 100MB（10MiB 对齐后 100MiB）切段，而不是 2GiB 默认值"
+        );
     }
 }

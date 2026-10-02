@@ -1,24 +1,31 @@
 pub mod cli;
 pub mod downloader;
+pub mod entry;
+pub mod node_cli;
+pub mod season_cli;
 pub mod server;
+pub mod tools;
 pub mod upload_lock;
 pub mod uploader;
+pub mod web_user_cli;
 
 // use crate::server::api::router::ApplicationController;
 use crate::server::app::ApplicationController;
 use crate::server::config::{Config, StreamerConfig};
 use crate::server::core::download_manager::DownloadManager;
 use crate::server::errors::{AppError, AppResult};
+use crate::server::fleet::FleetOptions;
 use crate::server::infrastructure::connection_pool::ConnectionManager;
 use crate::server::infrastructure::models::live_streamer::InsertLiveStreamer;
 use crate::server::infrastructure::models::upload_streamer::{
-    InsertUploadStreamer, UploadStreamer,
+    InsertUploadStreamer, UploadStreamer, is_noop_uploader,
 };
 use crate::server::infrastructure::repositories;
 use crate::server::infrastructure::service_register::ServiceRegister;
 use clap::ValueEnum;
-use error_stack::{Report, ResultExt};
-use std::net::ToSocketAddrs;
+use error_stack::{Report, ResultExt, bail};
+use futures::future::BoxFuture;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tracing_subscriber::{EnvFilter, Registry, reload};
@@ -26,7 +33,7 @@ use tracing_subscriber::{EnvFilter, Registry, reload};
 // 定义 Handle 的类型别名，简化代码
 // EnvFilter: 我们使用的过滤器类型
 // Registry: 基础的 Subscriber 类型
-type LogHandle = reload::Handle<EnvFilter, Registry>;
+pub type LogHandle = reload::Handle<EnvFilter, Registry>;
 
 pub async fn run(
     addr: (&str, u16),
@@ -34,6 +41,76 @@ pub async fn run(
     log_handle: LogHandle,
     config_path: Option<PathBuf>,
 ) -> AppResult<()> {
+    run_with_cookie(
+        addr,
+        auth,
+        false,
+        log_handle,
+        config_path,
+        PathBuf::from("cookies.json"),
+    )
+    .await
+}
+
+pub async fn run_with_cookie(
+    addr: (&str, u16),
+    auth: bool,
+    secure_session_cookie: bool,
+    log_handle: LogHandle,
+    config_path: Option<PathBuf>,
+    user_cookie: PathBuf,
+) -> AppResult<()> {
+    let listener = bind(addr, auth).await?;
+    serve_on(
+        listener,
+        auth,
+        secure_session_cookie,
+        log_handle,
+        config_path,
+        user_cookie,
+        FleetOptions::default(),
+        None,
+    )
+    .await
+}
+
+/// Resolves and binds the Web server address, refusing an unauthenticated
+/// non-loopback bind.
+pub async fn bind(addr: (&str, u16), auth: bool) -> AppResult<tokio::net::TcpListener> {
+    let addr = addr
+        .to_socket_addrs()
+        .change_context(AppError::Unknown)?
+        .next()
+        .ok_or_else(|| {
+            Report::new(AppError::Custom(
+                "bind address resolved to no sockets".into(),
+            ))
+        })?;
+    validate_server_exposure(addr, auth)?;
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .change_context(AppError::Unknown)
+        .attach_with(|| format!("could not listen on {addr}"))
+}
+
+/// Runs the Web server on an already-bound `listener`. With `shutdown`, the
+/// server stops when that future completes and does not install its own
+/// Ctrl+C / SIGTERM handlers, leaving signals to the embedding host.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_on(
+    listener: tokio::net::TcpListener,
+    auth: bool,
+    secure_session_cookie: bool,
+    log_handle: LogHandle,
+    config_path: Option<PathBuf>,
+    user_cookie: PathBuf,
+    fleet: FleetOptions,
+    shutdown: Option<BoxFuture<'static, ()>>,
+) -> AppResult<()> {
+    let addr = listener.local_addr().change_context(AppError::Unknown)?;
+    validate_server_exposure(addr, auth)?;
+    server::fleet::reject_config_file(config_path.as_deref())?;
+
     // let config = Arc::new(AppConfig::parse());
 
     tracing::info!(
@@ -41,7 +118,42 @@ pub async fn run(
     );
     let conn_pool = ConnectionManager::new_pool("data/data.sqlite3")
         .await
-        .expect("could not initialize the database connection pool");
+        .attach("could not initialize the database connection pool")?;
+    // 先收尾上次异常退出留下的分段与场次，再开始监控录制
+    if let Err(e) = server::workbench::recover(&conn_pool).await {
+        tracing::warn!(error = %e, "切片工作台启动收尾失败，不影响录制与上传");
+    }
+    server::workbench::clips::remove_leftovers(std::path::Path::new(
+        server::infrastructure::service_register::CLIPS_DIR,
+    ));
+    match server::workbench::clips::recover(&conn_pool, server::workbench::recorder::now_ms()).await
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(clips = n, "上次没导出完的切片已记为失败，可以重试"),
+        Err(e) => tracing::warn!(error = %e, "收尾没导出完的切片失败"),
+    }
+    match server::workbench::clips::recover_submits(
+        &conn_pool,
+        server::workbench::recorder::now_ms(),
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            clips = n,
+            "上次投稿到一半服务退出了，这些切片的投稿结果未知：再次发布前请先到 B 站稿件管理确认是否已投稿"
+        ),
+        Err(e) => tracing::warn!(error = %e, "标记投稿结果未知的切片失败"),
+    }
+
+    if let Some(configuration) =
+        repositories::register_bilibili_cookie(&conn_pool, &user_cookie).await?
+    {
+        tracing::info!(
+            cookie_file = %configuration.value,
+            "registered CLI Bilibili cookie file for Web UI"
+        );
+    }
 
     let loaded_config = if let Some(path) = config_path.as_deref() {
         let config = Config::load(path)?;
@@ -50,8 +162,17 @@ pub async fn run(
     } else {
         repositories::get_config(&conn_pool).await?
     };
+    tools::set_configured_ffmpeg(loaded_config.ffmpeg_path.as_deref());
+    if cfg!(windows) {
+        tracing::info!(
+            create_no_window = biliup::tools::hides_console_windows(),
+            "child processes get CREATE_NO_WINDOW only when this process has no console"
+        );
+    }
 
     let config = Arc::new(RwLock::new(loaded_config));
+    let _sweeper = server::workbench::retention::spawn_sweeper(conn_pool.clone(), config.clone());
+    server::auto_clip::runner::install(conn_pool.clone(), config.clone()).await;
     let download_manager = DownloadManager::new(
         config.read().unwrap().pool1_size,
         config.read().unwrap().pool2_size,
@@ -71,15 +192,28 @@ pub async fn run(
         import_database_streamers(&service_register).await?;
     }
 
+    let fleet = server::fleet::start(&fleet, &service_register).await?;
+
     tracing::info!("migrations successfully ran, initializing axum server...");
-    let addr = addr
-        .to_socket_addrs()
-        .change_context(AppError::Unknown)?
-        .next()
-        .unwrap();
-    ApplicationController::serve(&addr, auth, service_register)
-        .await
-        .attach("could not initialize application routes")?;
+    ApplicationController::serve(
+        listener,
+        auth,
+        secure_session_cookie,
+        service_register,
+        fleet,
+        shutdown,
+    )
+    .await
+    .attach("could not initialize application routes")?;
+    Ok(())
+}
+
+fn validate_server_exposure(addr: SocketAddr, auth: bool) -> AppResult<()> {
+    if !addr.ip().is_loopback() && !auth {
+        bail!(AppError::Custom(format!(
+            "refusing to expose the unauthenticated Web API on {addr}; use a loopback bind address or enable --auth"
+        )));
+    }
     Ok(())
 }
 
@@ -182,10 +316,7 @@ fn to_upload_streamer_insert(
     global_uploader: Option<String>,
 ) -> AppResult<Option<InsertUploadStreamer>> {
     let uploader = streamer.uploader.clone().or(global_uploader);
-    if uploader
-        .as_deref()
-        .is_some_and(|value| value.eq_ignore_ascii_case("noop"))
-    {
+    if is_noop_uploader(uploader.as_deref()) {
         return Ok(None);
     }
 
@@ -207,6 +338,7 @@ fn to_upload_streamer_insert(
                 })
             })
             .transpose()?,
+        tid_v2: streamer.tid_v2,
         copyright: streamer.copyright,
         copyright_source: streamer.copyright_source.clone(),
         cover_path: streamer
@@ -249,6 +381,7 @@ fn to_upload_streamer_insert(
 fn has_upload_config(streamer: &StreamerConfig) -> bool {
     streamer.title.is_some()
         || streamer.tid.is_some()
+        || streamer.tid_v2.is_some()
         || streamer.copyright.is_some()
         || streamer.copyright_source.is_some()
         || streamer.cover_path.is_some()
@@ -316,7 +449,81 @@ pub enum UploadLine {
     Cntx,
     Antx,
     Attx,
-    Bda,
     Txa,
     Alia,
+    Estx,
+    Akbd,
+}
+
+#[cfg(test)]
+mod server_exposure_tests {
+    use super::validate_server_exposure;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn unauthenticated_server_is_limited_to_loopback() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            assert!(validate_server_exposure(SocketAddr::new(ip, 19159), false).is_ok());
+        }
+        assert!(
+            validate_server_exposure(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 19159),
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    /// The Web administrator is bootstrapped over the network on first visit, so
+    /// an authenticated server must start on a non-loopback bind even when no
+    /// administrator exists yet — a container or headless host has no way to
+    /// reach a loopback-only bind to initialize one.
+    #[test]
+    fn authenticated_server_can_bind_non_loopback_before_bootstrap() {
+        assert!(
+            validate_server_exposure(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 19159),
+                true,
+            )
+            .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tid_v2_config_tests {
+    use super::{has_upload_config, to_upload_streamer_insert};
+    use crate::server::config::StreamerConfig;
+
+    #[test]
+    fn upload_insert_propagates_tid_v2() {
+        let streamer = StreamerConfig {
+            tid: Some(95),
+            tid_v2: Some(2102),
+            tags: Some(vec!["tag".into()]),
+            ..Default::default()
+        };
+        assert!(has_upload_config(&streamer));
+        let insert = to_upload_streamer_insert("demo", &streamer, None)
+            .unwrap()
+            .expect("should create insert");
+        assert_eq!(insert.tid, Some(95));
+        assert_eq!(insert.tid_v2, Some(2102));
+    }
+
+    #[test]
+    fn upload_insert_tid_only_keeps_tid_v2_none() {
+        let streamer = StreamerConfig {
+            tid: Some(171),
+            ..Default::default()
+        };
+        let insert = to_upload_streamer_insert("demo", &streamer, None)
+            .unwrap()
+            .expect("should create insert");
+        assert_eq!(insert.tid, Some(171));
+        assert!(insert.tid_v2.is_none());
+    }
 }

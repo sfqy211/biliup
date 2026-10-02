@@ -1,20 +1,43 @@
 use crate::server::common::download::start_download_workflow;
+use crate::server::common::recording_policy;
 use crate::server::common::upload::UploaderMessage;
-use crate::server::core::live::{live_request, streamer_info};
+use crate::server::core::live::{batch_check_request, live_request, streamer_info};
+use crate::server::core::slots::{Slot, Slots};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::{Context, Stage, Worker, WorkerStatus};
-use crate::server::infrastructure::models::StreamerInfo;
+use crate::server::workbench;
 use async_channel::Sender;
 use biliup::downloader::live::{LivePlugin, LiveStatus};
-use ormlite::Model;
-use ormlite::model::ModelBuilder;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
+
+/// 批量检测平台的开播缓存：一次批量请求的结果在一个检测周期内复用，
+/// 供逐间循环快速判定某房间是否开播，避免对未开播房间做逐间请求。
+#[derive(Debug)]
+struct BatchLiveCache {
+    live_urls: HashSet<String>,
+    refreshed_at: Instant,
+}
+
+/// 批量检测对单个房间的判定结果。
+enum BatchVerdict {
+    /// 批量结果显示开播，继续逐间完整检测以获取流信息
+    Live,
+    /// 批量结果显示未开播，直接放回队列
+    Offline,
+    /// 平台不支持批量检测或本轮批量请求失败，回退逐间检测
+    Fallback,
+}
+
+/// 无网络开销的跳过路径（批量结果判定未开播、不在录制时间范围内）使用的快速轮换间隔：
+/// 这些判定不发请求，短暂停即可在一个检测周期内扫完整个队列，
+/// 也让窗口一开就能立刻开录（网络频率仍由批量缓存 TTL 限制）。
+const QUICK_ROTATE_SLEEP: Duration = Duration::from_secs(1);
 
 /// 房间处理器
 /// 管理多个直播间的状态和操作
@@ -26,11 +49,14 @@ pub struct Monitor {
     pool: ConnectionPool,
     /// 上传消息发送器，下载任务产生分段后会通过它交给上传流程。
     uploader: Sender<UploaderMessage>,
-    /// 下载池许可。监控循环必须先拿到许可，才允许检测开播并启动录制。
+    /// 下载池槽位。监控循环必须先拿到槽位，才允许检测开播并启动录制。
     /// 这样 “开播了/成功开始录制” 只会出现在真正拥有下载并发槽位时。
-    /// 许可由下载任务持有到录制结束，pool1_size 的唯一限流语义在这里表达。
-    download_slots: Arc<Semaphore>,
+    /// 槽位由下载任务持有到录制结束，pool1_size 的唯一限流语义在这里表达；
+    /// 容量随配置保存即时调整（`DownloadManager::resize_pools`）。
+    download_slots: Arc<Slots>,
     monitors: RwLock<HashMap<String, JoinHandle<()>>>,
+    /// 各批量检测平台的开播缓存（platform_name -> 最近一次批量结果）。
+    batch_live: RwLock<HashMap<String, BatchLiveCache>>,
 }
 
 impl Drop for Monitor {
@@ -55,7 +81,7 @@ impl Monitor {
     /// * `name` - 平台名称
     pub fn new(
         uploader: Sender<UploaderMessage>,
-        download_slots: Arc<Semaphore>,
+        download_slots: Arc<Slots>,
         pool: ConnectionPool,
     ) -> Self {
         // 创建消息通道
@@ -70,6 +96,7 @@ impl Monitor {
             uploader,
             download_slots,
             monitors: Default::default(),
+            batch_live: Default::default(),
         }
     }
 
@@ -93,53 +120,136 @@ impl Monitor {
                 .await;
             let url = room.get_streamer().url.clone();
             let interval = room.get_config().event_loop_interval;
-            let Some(download_permit) = self.try_acquire_download_slot(&room).await else {
+            // 探测前的录制策略：不满足就直接放回队列，既不占用下载槽位也不发任何请求。
+            // 这类条件只看配置和时钟、判定无开销，所以用快速轮换而不是整个检测周期，
+            // 条件一满足即可开录。
+            if let Some(rejection) = recording_policy::reject_before_probe(room.get_streamer()) {
+                self.wake_waker(room.id()).await;
+                debug!(url = url, reason = %rejection, "跳过检测");
+                tokio::time::sleep(QUICK_ROTATE_SLEEP).await;
+                continue;
+            }
+            // 批量检测平台：先用一个检测周期内共享的批量结果快速判定是否开播。
+            // 未开播直接跳过（不占用下载槽位、不做逐间请求），并以较短间隔轮换到
+            // 下一个房间，使整条队列在一个检测周期内扫完；批量请求本身由缓存 TTL 限流。
+            if plugin.supports_batch_check() {
+                match self
+                    .batch_verdict(platform_name, &plugin, &room, interval)
+                    .await
+                {
+                    BatchVerdict::Offline => {
+                        self.wake_waker(room.id()).await;
+                        debug!(url = url, "批量检测未开播");
+                        tokio::time::sleep(QUICK_ROTATE_SLEEP).await;
+                        continue;
+                    }
+                    // Live / Fallback 都继续走下面的逐间完整检测
+                    BatchVerdict::Live | BatchVerdict::Fallback => {}
+                }
+            }
+            let Some(download_slot) = self.try_acquire_download_slot(&room).await else {
                 self.wake_waker(room.id()).await;
                 tokio::time::sleep(Duration::from_secs(interval)).await;
                 continue;
             };
             let request = live_request(&room);
             // 检查直播状态
+            // 没有开始录制的分支都要先归还槽位，不能带着它睡过检测间隔：各平台的监控循环
+            // 共用下载池，只剩一个空闲槽位时会被一个平台的循环一直占着，其他平台的房间
+            // 始终拿不到槽位去检测。
             match plugin.check_stream(request).await {
                 Ok(LiveStatus::Live { stream }) => {
-                    let sql_no_id = streamer_info(&stream);
-                    let insert = match StreamerInfo::builder()
-                        .url(sql_no_id.url.clone())
-                        .name(room.live_streamer.remark.clone())
-                        .title(sql_no_id.title.clone())
-                        .date(sql_no_id.date)
-                        .live_cover_path(sql_no_id.live_cover_path.clone())
-                        .insert(&self.pool)
-                        .await
+                    // 检测期间被暂停了（界面上点了暂停、Fleet 节点启动时恢复暂停状态）：不开录。
+                    // 暂停时已经移出队列，这里也不放回，等恢复时再入队
+                    if matches!(*room.downloader_status.read().unwrap(), WorkerStatus::Pause) {
+                        drop(download_slot);
+                        info!(url = url, "检测期间已暂停，不开录");
+                        continue;
+                    }
+                    // 一主一备：主机在等备机上报 / 备机正在录这一场，模式 2 备机在主机在线时只监控不录
+                    if let Some(hold) = crate::server::fleet::ha::hold_recording(&url) {
+                        drop(download_slot);
+                        self.wake_waker(room.id()).await;
+                        info!(url = url, reason = hold.reason, "开播但不录制（HA）");
+                        let wait = if hold.quick {
+                            QUICK_ROTATE_SLEEP
+                        } else {
+                            Duration::from_secs(interval)
+                        };
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    // 依赖房间标题的策略要拿到流信息才能判定。命中就按「本轮不录」处理：
+                    // 不建场次记录、不启动下载，等下个检测周期再看。
+                    if let Some(rejection) =
+                        recording_policy::reject_before_record(room.get_streamer(), &stream.title)
                     {
-                        Ok(insert) => insert,
+                        drop(download_slot);
+                        room.set_rejection(Some(rejection.clone()));
+                        self.wake_waker(room.id()).await;
+                        info!(url = url, title = stream.title, reason = %rejection, "开播但不录制");
+                        tokio::time::sleep(Duration::from_secs(interval)).await;
+                        continue;
+                    }
+                    room.set_rejection(None);
+                    let mut info = streamer_info(&stream);
+                    info.name = room.live_streamer.remark.clone();
+                    let merge_window_ms = room
+                        .get_config()
+                        .live_merge_minutes
+                        .saturating_mul(60_000)
+                        .min(i64::MAX as u64) as i64;
+                    let session = match workbench::store::open_session(
+                        &self.pool,
+                        room.live_streamer.id,
+                        &info,
+                        workbench::recorder::now_ms(),
+                        merge_window_ms,
+                    )
+                    .await
+                    {
+                        Ok(session) => session,
                         Err(e) => {
                             error!(e=?e, "插入数据库失败");
                             self.wake_waker(room.id()).await;
                             continue;
                         }
                     };
-                    info!(url = url, "room: is live -> 开播了");
+                    if session.resumed {
+                        info!(
+                            url = url,
+                            session = session.id,
+                            "room: is live -> 开播了（下播后很快又开播，接着记在上一场）"
+                        );
+                    } else {
+                        info!(url = url, "room: is live -> 开播了");
+                    }
 
-                    let context = Context::new(insert.id, room.clone(), self.pool.clone(), *stream);
+                    let context =
+                        Context::new(session.id, room.clone(), self.pool.clone(), *stream);
                     let downloader = plugin.clone();
                     let uploader = self.uploader.clone();
                     let rooms_handle = Arc::clone(self);
 
-                    // 只能在已经拿到下载池许可后启动录制。许可移动到任务内并持有到流程结束，
+                    // 只能在已经拿到下载池槽位后启动录制。槽位移动到任务内并持有到流程结束，
                     // 因此 pool1_size 只在这里表达，不再通过下载 Actor 池或消息队列重复限流。
                     tokio::spawn(async move {
-                        let _download_permit = download_permit;
+                        let _download_slot = download_slot;
                         start_download_workflow(downloader, context, uploader, rooms_handle).await;
                     });
 
                     info!("成功开始录制 {}", url);
                 }
                 Ok(LiveStatus::Offline) => {
+                    drop(download_slot);
+                    // 探测结果推翻了上一轮的策略判定，清掉以免界面停在旧原因上
+                    room.set_rejection(None);
                     self.wake_waker(room.id()).await;
                     debug!(url = room.get_streamer().url, "未开播")
                 }
                 Err(e) => {
+                    drop(download_slot);
+                    room.set_rejection(None);
                     self.wake_waker(room.id()).await;
                     error!(e=?e, ctx=room.get_streamer().url,"检查直播间出错")
                 }
@@ -150,17 +260,93 @@ impl Monitor {
         info!("exit -> [{platform_name}]")
     }
 
-    async fn try_acquire_download_slot(&self, room: &Arc<Worker>) -> Option<OwnedSemaphorePermit> {
-        match self.download_slots.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                debug!(
-                    url = room.get_streamer().url,
-                    "download pool is full, skip live check"
+    async fn try_acquire_download_slot(&self, room: &Arc<Worker>) -> Option<Slot> {
+        let slot = self.download_slots.try_acquire();
+        if slot.is_none() {
+            debug!(
+                url = room.get_streamer().url,
+                "download pool is full, skip live check"
+            );
+        }
+        slot
+    }
+
+    /// 用批量检测结果判定单个房间是否开播。
+    /// 缓存超过一个检测周期即刷新：以当前房间的客户端/配置为该平台所有房间发起一次批量请求。
+    async fn batch_verdict(
+        self: &Arc<Self>,
+        platform_name: &str,
+        plugin: &Arc<dyn LivePlugin + Send + Sync>,
+        room: &Arc<Worker>,
+        interval: u64,
+    ) -> BatchVerdict {
+        let url = room.get_streamer().url.clone();
+
+        // 命中未过期缓存直接判定
+        if let Some(cache) = self.batch_live.read().unwrap().get(platform_name)
+            && cache.refreshed_at.elapsed() < Duration::from_secs(interval)
+        {
+            return if cache.live_urls.contains(&url) {
+                BatchVerdict::Live
+            } else {
+                BatchVerdict::Offline
+            };
+        }
+
+        // 缓存过期或缺失：为该平台所有房间发起一次批量检测
+        let urls = self.platform_urls(platform_name).await;
+        if urls.is_empty() {
+            return BatchVerdict::Fallback;
+        }
+        let request = batch_check_request(room, urls);
+        match plugin.batch_check(request).await {
+            Ok(live_urls) => {
+                let live_urls: HashSet<String> = live_urls.into_iter().collect();
+                let is_live = live_urls.contains(&url);
+                self.batch_live.write().unwrap().insert(
+                    platform_name.to_string(),
+                    BatchLiveCache {
+                        live_urls,
+                        refreshed_at: Instant::now(),
+                    },
                 );
-                None
+                if is_live {
+                    BatchVerdict::Live
+                } else {
+                    BatchVerdict::Offline
+                }
+            }
+            Err(e) => {
+                // 批量请求失败时回退逐间检测，避免整平台漏检
+                warn!(platform = platform_name, e = ?e, "批量检测失败，回退逐间检测");
+                BatchVerdict::Fallback
             }
         }
+    }
+
+    /// 按房间 URL 找到对应的平台插件。
+    pub async fn plugin_for(
+        self: &Arc<Self>,
+        url: &str,
+    ) -> Option<Arc<dyn LivePlugin + Send + Sync>> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::PluginFor {
+            respond_to: send,
+            url: url.to_owned(),
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.ok().flatten()
+    }
+
+    /// 获取某平台当前队列中所有房间的 URL（用于批量检测）。
+    async fn platform_urls(self: &Arc<Self>, platform_name: &str) -> Vec<String> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::PlatformUrls {
+            respond_to: send,
+            platform_name: platform_name.to_owned(),
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.unwrap_or_default()
     }
 
     /// 添加工作器到房间列表
@@ -350,6 +536,16 @@ enum ActorMessage {
         respond_to: oneshot::Sender<Option<Arc<Worker>>>,
         platform_name: String,
     },
+    /// 获取某平台所有房间的 URL（用于批量检测）
+    PlatformUrls {
+        respond_to: oneshot::Sender<Vec<String>>,
+        platform_name: String,
+    },
+    /// 按房间 URL 找到对应平台插件（预览直连模式向平台要一条新直链时用）
+    PluginFor {
+        respond_to: oneshot::Sender<Option<Arc<dyn LivePlugin + Send + Sync>>>,
+        url: String,
+    },
     /// 添加工作器
     Add(
         oneshot::Sender<Option<Arc<dyn LivePlugin + Send + Sync>>>,
@@ -424,6 +620,16 @@ impl RoomsActor {
                     // `let _ =` 忽略发送时的任何错误
                     // 如果使用`select!`宏取消等待响应，可能会发生这种情况
                     let _ = respond_to.send(self.next(&platform_name));
+                }
+                ActorMessage::PluginFor { respond_to, url } => {
+                    let _ = respond_to.send(self.matches(&url));
+                }
+                ActorMessage::PlatformUrls {
+                    respond_to,
+                    platform_name,
+                } => {
+                    // `let _ =` 忽略发送时的任何错误
+                    let _ = respond_to.send(self.platform_urls(&platform_name));
                 }
                 ActorMessage::Add(respond_to, worker) => {
                     let plugin = self.add(worker);
@@ -510,6 +716,19 @@ impl RoomsActor {
         Some(arc)
     }
 
+    /// 获取某平台所有房间的 URL（含正在检测、已弹出队列的房间）。
+    /// 以 all_workers 为源按插件归属过滤，保证覆盖整平台而非仅队列内房间。
+    fn platform_urls(&self, platform_name: &str) -> Vec<String> {
+        self.all_workers
+            .iter()
+            .filter(|worker| {
+                self.matches(&worker.live_streamer.url)
+                    .is_some_and(|plugin| plugin.name() == platform_name)
+            })
+            .map(|worker| worker.live_streamer.url.clone())
+            .collect()
+    }
+
     /// 放回工作队列
     fn push_back(&mut self, id: i64) -> Option<Arc<dyn LivePlugin + Send + Sync>> {
         // 在总数组中找不到，说明该房间已被移除我们也不放回
@@ -589,4 +808,185 @@ impl RoomsActor {
 
 fn reuse_vec_arc<'a, T: 'a, U: Iterator<Item = &'a Arc<T>>>(v: &mut U) -> Vec<Arc<T>> {
     v.into_iter().cloned().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Monitor;
+    use crate::server::config::Config;
+    use crate::server::core::slots::Slots;
+    use crate::server::infrastructure::connection_pool::ConnectionManager;
+    use crate::server::infrastructure::context::Worker;
+    use crate::server::infrastructure::context::{Stage, WorkerStatus};
+    use crate::server::infrastructure::models::live_streamer::LiveStreamer;
+    use async_trait::async_trait;
+    use biliup::downloader::live::{LivePlugin, LiveRequest, LiveResult, LiveStatus};
+    use std::collections::HashSet;
+    use std::sync::{Arc, RwLock};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// 始终未开播的平台，每次检测都把房间地址报给测试
+    struct OfflinePlatform {
+        name: &'static str,
+        probed: mpsc::UnboundedSender<String>,
+    }
+
+    #[async_trait]
+    impl LivePlugin for OfflinePlatform {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn matches(&self, url: &str) -> bool {
+            url.starts_with(&format!("https://{}.example/", self.name))
+        }
+
+        async fn check_stream(&self, request: LiveRequest) -> LiveResult<LiveStatus> {
+            let _ = self.probed.send(request.url);
+            Ok(LiveStatus::Offline)
+        }
+    }
+
+    /// 检测一直卡着、放行后报开播的平台
+    struct GatedPlatform {
+        probing: mpsc::UnboundedSender<()>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl LivePlugin for GatedPlatform {
+        fn name(&self) -> &'static str {
+            "gated"
+        }
+
+        fn matches(&self, url: &str) -> bool {
+            url.starts_with("https://gated.example/")
+        }
+
+        async fn check_stream(&self, request: LiveRequest) -> LiveResult<LiveStatus> {
+            let _ = self.probing.send(());
+            self.gate.notified().await;
+            let stream = serde_json::from_value(serde_json::json!({
+                "name": "gated", "url": request.url, "title": "t", "date": "2026-01-01T00:00:00Z",
+                "live_cover_url": "", "raw_stream_url": "http://127.0.0.1:9/x.flv", "platform": "gated",
+                "stream_headers": {}, "suffix": "flv", "danmaku": null, "downloader_hint": "StreamGears",
+                "runtime_options": null,
+            }))
+            .unwrap();
+            Ok(LiveStatus::Live { stream })
+        }
+    }
+
+    fn worker(id: i64, url: &str) -> Arc<Worker> {
+        let streamer = LiveStreamer {
+            id,
+            url: url.to_string(),
+            remark: url.to_string(),
+            filename_prefix: None,
+            time_range: None,
+            upload_streamers_id: None,
+            format: None,
+            override_cfg: None,
+            preprocessor: None,
+            segment_processor: None,
+            downloaded_processor: None,
+            postprocessor: None,
+            opt_args: None,
+            excluded_keywords: None,
+        };
+        Arc::new(Worker::new(
+            streamer,
+            None,
+            Arc::new(RwLock::new(Config::default())),
+            Default::default(),
+        ))
+    }
+
+    /// 未开播的检测结束就归还下载池槽位，不带着它睡过检测间隔（默认 30 s）：
+    /// 只剩一个空闲槽位时，每个平台的监控循环都还能轮到检测
+    #[tokio::test]
+    async fn an_offline_probe_returns_the_download_slot_before_sleeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.sqlite3");
+        let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+            .await
+            .unwrap();
+        let (uploader, _) = async_channel::bounded(1);
+        let monitor = Arc::new(Monitor::new(uploader, Arc::new(Slots::new(1)), pool));
+        let (probed_tx, mut probed) = mpsc::unbounded_channel();
+        for name in ["a", "b"] {
+            monitor
+                .add_plugin(Arc::new(OfflinePlatform {
+                    name,
+                    probed: probed_tx.clone(),
+                }))
+                .await;
+        }
+        monitor.add(worker(1, "https://a.example/1")).await.unwrap();
+        monitor.add(worker(2, "https://b.example/2")).await.unwrap();
+
+        let mut seen = HashSet::new();
+        while seen.len() < 2 {
+            let url = tokio::time::timeout(Duration::from_secs(5), probed.recv())
+                .await
+                .expect("两个平台都应在一个检测间隔内轮到检测")
+                .unwrap();
+            seen.insert(url);
+        }
+    }
+
+    /// 检测期间被暂停（界面暂停、Fleet 节点启动时恢复暂停状态）的房间，检测报开播也不开录
+    #[tokio::test]
+    async fn a_room_paused_during_its_live_check_does_not_start_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.sqlite3");
+        let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+            .await
+            .unwrap();
+        let (uploader, _) = async_channel::bounded(1);
+        let monitor = Arc::new(Monitor::new(
+            uploader,
+            Arc::new(Slots::new(1)),
+            pool.clone(),
+        ));
+        let (probing, mut probed) = mpsc::unbounded_channel();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        monitor
+            .add_plugin(Arc::new(GatedPlatform {
+                probing,
+                gate: gate.clone(),
+            }))
+            .await;
+        // 场次记录挂在直播间行上：没有这一行，开场次失败，看不出有没有开录
+        sqlx::query("INSERT INTO livestreamers (id, url, remark) VALUES (1, ?, 'gated')")
+            .bind("https://gated.example/1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let room = worker(1, "https://gated.example/1");
+        monitor.add(room.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), probed.recv())
+            .await
+            .expect("房间应当开始检测")
+            .unwrap();
+
+        // 与 `toggle_pause` 对检测中（Pending）房间的做法一致
+        room.change_status(Stage::Download, WorkerStatus::Pause)
+            .await;
+        monitor.make_waker(room.id()).await;
+        gate.notify_one();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(matches!(
+            *room.downloader_status.read().unwrap(),
+            WorkerStatus::Pause
+        ));
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stream_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0, "没有开场次，也就没有开录");
+        assert!(probed.try_recv().is_err(), "暂停的房间不再被检测");
+    }
 }

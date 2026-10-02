@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{error, warn};
 use url::Url;
 
 const BILIBILI_API_BASE: &str = "https://api.live.bilibili.com";
@@ -21,6 +22,8 @@ const WBI_WEB_LOCATION: &str = "444.8";
 
 pub struct Bilibili {
     re: Regex,
+    /// WBI key 状态跨 check_stream 共享，避免每轮重建导致 2 小时缓存失效
+    wbi_signer: WbiSigner,
 }
 
 impl Default for Bilibili {
@@ -32,8 +35,8 @@ impl Default for Bilibili {
 impl Bilibili {
     pub fn new() -> Self {
         Self {
-            re: Regex::new(r"(?:https?://)?(?:b23\.tv|(?:(?:www|m|live)\.)?bilibili\.com)")
-                .unwrap(),
+            re: Regex::new(r"(?:https?://)?(?:b23\.tv|live\.bilibili\.com)").unwrap(),
+            wbi_signer: WbiSigner::new(),
         }
     }
 }
@@ -49,7 +52,9 @@ impl LivePlugin for Bilibili {
     }
 
     async fn check_stream(&self, request: LiveRequest) -> LiveResult<LiveStatus> {
-        BilibiliLive::new(request).check_stream().await
+        BilibiliLive::new(request, self.wbi_signer.clone())
+            .check_stream()
+            .await
     }
 }
 
@@ -74,11 +79,11 @@ struct BilibiliLive {
 }
 
 impl BilibiliLive {
-    fn new(request: LiveRequest) -> Self {
+    fn new(request: LiveRequest, wbi_signer: WbiSigner) -> Self {
         let options = request.options.bilibili;
         let credentials = request.credentials;
         Self {
-            wbi_signer: WbiSigner::new(request.client.clone()),
+            wbi_signer,
             client: request.client,
             url: request.url,
             name: request.name,
@@ -111,7 +116,22 @@ impl BilibiliLive {
             return Ok(LiveStatus::Offline);
         };
         self.room_id = Some(profile.room_id);
-        let candidates = self.get_stream_candidates(&profile, headers).await?;
+        let mut candidates = self
+            .get_stream_candidates(&profile, headers.clone(), &self.protocol)
+            .await?;
+        if candidates.is_empty() && self.protocol == "hls_fmp4" {
+            // fmp4 流可能尚未转码完成：等待窗口内按未开播处理，超时后回退 stream(flv) 协议
+            if now_unix().saturating_sub(profile.live_start_time) <= self.hls_transcode_timeout {
+                warn!("{}: 暂未提供 hls_fmp4 流，等待下一次检测", self.name);
+                return Ok(LiveStatus::Offline);
+            }
+            candidates = self
+                .get_stream_candidates(&profile, headers, "stream")
+                .await?;
+        }
+        if candidates.is_empty() {
+            return Err(LiveError::custom(format!("获取 {} 流失败", self.protocol)));
+        }
         let raw_stream_url = self.select_stream_url(&candidates).await?;
         let danmaku = self.danmaku_source();
 
@@ -122,6 +142,7 @@ impl BilibiliLive {
                 title: profile.title,
                 date: Utc::now(),
                 live_cover_url: profile.cover,
+                avatar_url: (!profile.avatar.is_empty()).then_some(profile.avatar),
                 suffix: media_ext_from_url(&raw_stream_url).unwrap_or_else(|| {
                     if raw_stream_url.contains(".m3u8") {
                         "m3u8".to_string()
@@ -214,7 +235,9 @@ impl BilibiliLive {
         let mut params = BTreeMap::new();
         params.insert("room_id".to_string(), room_id.to_string());
         params.insert("web_location".to_string(), WBI_WEB_LOCATION.to_string());
-        self.wbi_signer.sign(&mut params, &headers).await?;
+        self.wbi_signer
+            .sign(&self.client, &mut params, &headers)
+            .await?;
 
         let room_info: Value = self
             .client
@@ -230,61 +253,15 @@ impl BilibiliLive {
             .await
             .map_err(|err| LiveError::custom(format!("解析 B 站直播间信息失败: {err}")))?;
 
-        if room_info.get("code").and_then(|code| code.as_i64()) != Some(0) {
-            return Err(LiveError::custom(format!(
-                "获取 B 站直播间信息错误: {}",
-                room_info
-                    .get("message")
-                    .or_else(|| room_info.get("msg"))
-                    .and_then(|msg| msg.as_str())
-                    .unwrap_or_default()
-            )));
-        }
-
-        let room = room_info
-            .get("data")
-            .and_then(|data| data.get("room_info"))
-            .ok_or_else(|| LiveError::custom("B 站直播间信息为空"))?;
-        if room.get("live_status").and_then(|status| status.as_i64()) != Some(1) {
-            return Ok(None);
-        }
-
-        Ok(Some(BiliRoomProfile {
-            room_id: room
-                .get("room_id")
-                .and_then(|room_id| room_id.as_u64())
-                .ok_or_else(|| LiveError::custom("B 站真实房间号为空"))?,
-            uid: room
-                .get("uid")
-                .and_then(|uid| uid.as_u64())
-                .unwrap_or_default(),
-            live_start_time: room
-                .get("live_start_time")
-                .and_then(|time| time.as_u64())
-                .unwrap_or_default(),
-            special_type: room
-                .get("special_type")
-                .and_then(|special_type| special_type.as_u64())
-                .unwrap_or_default(),
-            title: room
-                .get("title")
-                .and_then(|title| title.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            cover: room
-                .get("cover")
-                .and_then(|cover| cover.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        }))
+        parse_room_profile(&room_info)
     }
 
     async fn get_stream_candidates(
         &self,
         profile: &BiliRoomProfile,
         headers: HeaderMap,
+        protocol: &str,
     ) -> LiveResult<Vec<BiliStreamCandidate>> {
-        let mut last_error = None;
         for api in &self.api_list {
             match self
                 .request_play_info(api, profile.room_id, headers.clone())
@@ -292,17 +269,19 @@ impl BilibiliLive {
             {
                 Ok(play_info) => {
                     if let Some(candidates) = self
-                        .parse_play_info(api, profile, &play_info, &headers)
-                        .await?
+                        .parse_play_info(api, profile, &play_info, &headers, protocol)
+                        .await
+                        && !candidates.is_empty()
                     {
                         return Ok(candidates);
                     }
                 }
-                Err(err) => last_error = Some(err),
+                Err(err) => error!("{}: {api} 获取 play_info 失败: {err}", self.name),
             }
         }
 
-        Err(last_error.unwrap_or_else(|| LiveError::custom("获取 B 站直播流失败")))
+        // 与 Python 一致：空结果照常返回，等待/协议回退交给上层处理
+        Ok(Vec::new())
     }
 
     async fn request_play_info(
@@ -320,7 +299,9 @@ impl BilibiliLive {
         params.insert("codec".to_string(), "0".to_string());
         params.insert("dolby".to_string(), "5".to_string());
         params.insert("web_location".to_string(), WBI_WEB_LOCATION.to_string());
-        self.wbi_signer.sign(&mut params, &headers).await?;
+        self.wbi_signer
+            .sign(&self.client, &mut params, &headers)
+            .await?;
 
         let play_info: Value = self
             .client
@@ -353,24 +334,23 @@ impl BilibiliLive {
         profile: &BiliRoomProfile,
         play_info: &Value,
         headers: &HeaderMap,
-    ) -> LiveResult<Option<Vec<BiliStreamCandidate>>> {
-        let streams = match play_info
+        protocol: &str,
+    ) -> Option<Vec<BiliStreamCandidate>> {
+        let streams = play_info
             .get("data")
             .and_then(|data| data.get("playurl_info"))
             .and_then(|info| info.get("playurl"))
             .and_then(|playurl| playurl.get("stream"))
-            .and_then(Value::as_array)
-        {
-            Some(streams) => streams,
-            None => return Ok(None),
-        };
+            .and_then(Value::as_array)?;
 
-        if self.protocol == "hls_fmp4" {
-            if let Some(candidates) = self
+        if protocol == "hls_fmp4" {
+            match self
                 .master_m3u8_candidates(api, profile, play_info, headers)
-                .await?
+                .await
             {
-                return Ok(Some(candidates));
+                Ok(Some(candidates)) => return Some(candidates),
+                Ok(None) => {}
+                Err(err) => error!("{}: {api} 获取 m3u8 失败: {err}", self.name),
             }
 
             let candidates = streams
@@ -383,22 +363,17 @@ impl BilibiliLive {
                 .and_then(|format| format.get("codec"))
                 .and_then(Value::as_array)
                 .and_then(|codecs| codecs.first())
-                .and_then(parse_codec_urls);
-            if let Some(candidates) = &candidates
-                && self.qn >= 10000
+                .and_then(parse_codec_urls)?;
+            // fmp4 可能没有原画
+            if matches!(self.qn, 10000 | 25000)
                 && !candidates.iter().any(|candidate| candidate.qn == self.qn)
             {
-                return Ok(Some(Vec::new()));
+                return None;
             }
-            if candidates.is_some() {
-                return Ok(candidates);
-            }
-            if now_unix().saturating_sub(profile.live_start_time) <= self.hls_transcode_timeout {
-                return Ok(Some(Vec::new()));
-            }
+            return Some(candidates);
         }
 
-        Ok(streams
+        streams
             .first()
             .and_then(|stream| stream.get("format"))
             .and_then(Value::as_array)
@@ -406,7 +381,7 @@ impl BilibiliLive {
             .and_then(|format| format.get("codec"))
             .and_then(Value::as_array)
             .and_then(|codecs| codecs.first())
-            .and_then(parse_codec_urls))
+            .and_then(parse_codec_urls)
     }
 
     async fn master_m3u8_candidates(
@@ -435,7 +410,7 @@ impl BilibiliLive {
             return Ok(None);
         }
 
-        let mid = self.login_mid(headers).await?.unwrap_or(profile.uid);
+        let mid = self.login_mid(headers).await.unwrap_or(profile.uid);
         let text = self
             .client
             .get(format!("{api}/xlive/play-gateway/master/url"))
@@ -466,25 +441,41 @@ impl BilibiliLive {
         Ok(parse_master_m3u8(&text))
     }
 
-    async fn login_mid(&self, headers: &HeaderMap) -> LiveResult<Option<u64>> {
-        let value: Value = self
+    /// 获取登录用户 mid。与 Python 一致：nav 请求失败或未登录时返回 None，
+    /// 由调用方以主播 uid 兜底，不中断整次取流。
+    async fn login_mid(&self, headers: &HeaderMap) -> Option<u64> {
+        let response = match self
             .client
             .get("https://api.bilibili.com/x/web-interface/nav")
             .headers(headers.clone())
             .send()
             .await
-            .map_err(|err| LiveError::custom(format!("获取 B 站登录状态失败: {err}")))?
-            .json()
-            .await
-            .map_err(|err| LiveError::custom(format!("解析 B 站登录状态失败: {err}")))?;
-        Ok(value
+        {
+            Ok(response) => response,
+            Err(err) => {
+                error!("{}: 获取 B 站登录状态失败: {err}", self.name);
+                return None;
+            }
+        };
+        let value: Value = match response.json().await {
+            Ok(value) => value,
+            Err(err) => {
+                error!("{}: 解析 B 站登录状态失败: {err}", self.name);
+                return None;
+            }
+        };
+        let mid = value
             .get("data")
             .and_then(|data| data.get("isLogin"))
             .and_then(Value::as_bool)
             .filter(|is_login| *is_login)
             .and_then(|_| value.get("data"))
             .and_then(|data| data.get("mid"))
-            .and_then(Value::as_u64))
+            .and_then(Value::as_u64);
+        if mid.is_none() {
+            warn!("{}: 未登录，或将只能录制到最低画质。", self.name);
+        }
+        mid
     }
 
     async fn check_url_healthy(&self, url: &str) -> Option<String> {
@@ -544,18 +535,29 @@ impl BilibiliLive {
     }
 
     async fn select_stream_url(&self, candidates: &[BiliStreamCandidate]) -> LiveResult<String> {
-        let selected = if !self.cdn.is_empty()
-            && let Some(candidate) = self
-                .cdn
-                .iter()
-                .find_map(|cdn| candidates.iter().find(|candidate| &candidate.cdn == cdn))
-        {
-            candidate
+        let first = candidates
+            .first()
+            .ok_or_else(|| LiveError::custom("B 站可用直播流为空"))?;
+        // 按 bili_qn 精确匹配画质，选不中取第一组（master m3u8 已按 qn 降序，即最高画质）
+        let target_qn = if candidates.iter().any(|candidate| candidate.qn == self.qn) {
+            self.qn
         } else {
-            candidates
-                .first()
-                .ok_or_else(|| LiveError::custom("B 站可用直播流为空"))?
+            first.qn
         };
+        let group: Vec<&BiliStreamCandidate> = candidates
+            .iter()
+            .filter(|candidate| candidate.qn == target_qn)
+            .collect();
+        let selected = self
+            .cdn
+            .iter()
+            .find_map(|cdn| {
+                group
+                    .iter()
+                    .copied()
+                    .find(|candidate| &candidate.cdn == cdn)
+            })
+            .unwrap_or(group[0]);
 
         if !self.cdn_fallback {
             return Ok(selected.url.clone());
@@ -563,7 +565,7 @@ impl BilibiliLive {
         if let Some(url) = self.check_url_healthy(&selected.url).await {
             return Ok(url);
         }
-        for candidate in candidates {
+        for candidate in &group {
             if let Some(url) = self.check_url_healthy(&candidate.url).await {
                 return Ok(url);
             }
@@ -607,6 +609,64 @@ struct BiliRoomProfile {
     special_type: u64,
     title: String,
     cover: String,
+    /// 主播头像（`anchor_info.base_info.face`），与房间信息来自同一次响应
+    avatar: String,
+}
+
+/// 解析 `getInfoByRoom` 的响应；未开播返回 `Ok(None)`。
+fn parse_room_profile(room_info: &Value) -> LiveResult<Option<BiliRoomProfile>> {
+    if room_info.get("code").and_then(|code| code.as_i64()) != Some(0) {
+        return Err(LiveError::custom(format!(
+            "获取 B 站直播间信息错误: {}",
+            room_info
+                .get("message")
+                .or_else(|| room_info.get("msg"))
+                .and_then(|msg| msg.as_str())
+                .unwrap_or_default()
+        )));
+    }
+
+    let room = room_info
+        .get("data")
+        .and_then(|data| data.get("room_info"))
+        .ok_or_else(|| LiveError::custom("B 站直播间信息为空"))?;
+    if room.get("live_status").and_then(|status| status.as_i64()) != Some(1) {
+        return Ok(None);
+    }
+
+    Ok(Some(BiliRoomProfile {
+        room_id: room
+            .get("room_id")
+            .and_then(|room_id| room_id.as_u64())
+            .ok_or_else(|| LiveError::custom("B 站真实房间号为空"))?,
+        uid: room
+            .get("uid")
+            .and_then(|uid| uid.as_u64())
+            .unwrap_or_default(),
+        live_start_time: room
+            .get("live_start_time")
+            .and_then(|time| time.as_u64())
+            .unwrap_or_default(),
+        special_type: room
+            .get("special_type")
+            .and_then(|special_type| special_type.as_u64())
+            .unwrap_or_default(),
+        title: room
+            .get("title")
+            .and_then(|title| title.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        cover: room
+            .get("cover")
+            .and_then(|cover| cover.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        avatar: room_info
+            .pointer("/data/anchor_info/base_info/face")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    }))
 }
 
 struct BiliStreamCandidate {
@@ -636,28 +696,52 @@ fn parse_codec_urls(codec: &Value) -> Option<Vec<BiliStreamCandidate>> {
 
 fn parse_master_m3u8(text: &str) -> Option<Vec<BiliStreamCandidate>> {
     let mut current_qn = None;
-    let mut candidates = Vec::new();
+    let mut groups: BTreeMap<u32, Vec<BiliStreamCandidate>> = BTreeMap::new();
     for line in text.lines().map(str::trim) {
         if line.starts_with("#EXT-X-STREAM-INF:") {
-            current_qn = parse_stream_inf_qn(line);
-        } else if !line.is_empty() && !line.starts_with('#') {
-            candidates.push(BiliStreamCandidate {
-                qn: current_qn.unwrap_or_default(),
-                cdn: String::new(),
-                url: line.to_string(),
+            // 仅保留 CODECS 含 avc 的变体（跳过 hevc/av1）
+            current_qn = parse_stream_inf_qn(line).filter(|_| {
+                parse_stream_inf_codecs(line)
+                    .is_some_and(|codecs| codecs.to_ascii_lowercase().contains("avc"))
             });
-            current_qn = None;
+        } else if line.starts_with("http")
+            && let Some(qn) = current_qn
+        {
+            let cdn = extract_cdn(line);
+            if cdn.is_empty() {
+                continue;
+            }
+            let group = groups.entry(qn).or_default();
+            if !group.iter().any(|candidate| candidate.cdn == cdn) {
+                group.push(BiliStreamCandidate {
+                    qn,
+                    cdn,
+                    url: line.to_string(),
+                });
+            }
         }
     }
+    // 按 qn 降序展开，供选流时缺省取最高画质
+    let candidates: Vec<_> = groups
+        .into_iter()
+        .rev()
+        .flat_map(|(_, group)| group)
+        .collect();
     (!candidates.is_empty()).then_some(candidates)
 }
 
 fn parse_stream_inf_qn(line: &str) -> Option<u32> {
-    line.split(',').find_map(|part| {
-        let (key, value) = part.split_once('=')?;
-        matches!(key.trim(), "QN" | "QUALITY" | "BILI-QN")
-            .then(|| value.trim().trim_matches('"').parse().ok())?
-    })
+    Regex::new(r"BILI-QN=(\d+)")
+        .unwrap()
+        .captures(line)
+        .and_then(|captures| captures[1].parse().ok())
+}
+
+fn parse_stream_inf_codecs(line: &str) -> Option<String> {
+    Regex::new(r#"CODECS="([^"]+)""#)
+        .unwrap()
+        .captures(line)
+        .map(|captures| captures[1].to_string())
 }
 
 fn first_variant_uri(text: &str) -> Option<String> {
@@ -703,4 +787,117 @@ fn normalize_api(value: Option<&str>) -> String {
         format!("http://{value}")
     };
     value.trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matches_only_live_and_short_urls() {
+        let plugin = Bilibili::new();
+        assert!(plugin.matches("https://live.bilibili.com/12345"));
+        assert!(plugin.matches("http://live.bilibili.com/12345"));
+        assert!(plugin.matches("live.bilibili.com/12345"));
+        assert!(plugin.matches("https://b23.tv/abc123"));
+        assert!(plugin.matches("b23.tv/abc123"));
+        // 普通视频页/主站不应被认领
+        assert!(!plugin.matches("https://www.bilibili.com/video/BV1xx411c7mD"));
+        assert!(!plugin.matches("https://m.bilibili.com/video/BV1xx411c7mD"));
+        assert!(!plugin.matches("https://bilibili.com/12345"));
+        assert!(!plugin.matches("https://space.bilibili.com/1"));
+    }
+
+    const MASTER_M3U8: &str = concat!(
+        "#EXTM3U\n",
+        "#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"hev1.1.6.L120.90,mp4a.40.2\",RESOLUTION=1920x1080,BILI-QN=20000\n",
+        "https://cn-hevc.example.com/live-bvc/0/live_1_2/index.m3u8?cdn=cn-gotcha09&expires=1\n",
+        "#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.640028,mp4a.40.2\",RESOLUTION=1280x720,BILI-QN=400\n",
+        "https://cn-sd.example.com/live-bvc/0/live_1_2/index.m3u8?cdn=cn-gotcha02&expires=1\n",
+        "#EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS=\"avc1.640032,mp4a.40.2\",RESOLUTION=1920x1080,BILI-QN=10000\n",
+        "https://cn-hd.example.com/live-bvc/0/live_1_2/index.m3u8?cdn=cn-gotcha01&expires=1\n",
+        "#EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS=\"avc1.640032,mp4a.40.2\",RESOLUTION=1920x1080,BILI-QN=10000\n",
+        "https://ov-hd.example.com/live-bvc/0/live_1_2/index.m3u8?cdn=ov-gotcha05&expires=1\n",
+    );
+
+    #[test]
+    fn parse_master_m3u8_filters_non_avc_and_sorts_by_qn_desc() {
+        let candidates = parse_master_m3u8(MASTER_M3U8).unwrap();
+
+        // hevc 变体被过滤
+        assert!(candidates.iter().all(|candidate| candidate.qn != 20000));
+        // 按 qn 降序：两个 10000 在前，400 在最后
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.qn)
+                .collect::<Vec<_>>(),
+            vec![10000, 10000, 400]
+        );
+        // cdn 从 URL 的 cdn= 参数提取
+        assert_eq!(candidates[0].cdn, "cn-gotcha01");
+        assert_eq!(candidates[1].cdn, "ov-gotcha05");
+        assert_eq!(candidates[2].cdn, "cn-gotcha02");
+        assert!(candidates[0].url.starts_with("https://cn-hd.example.com/"));
+    }
+
+    #[test]
+    fn parse_master_m3u8_skips_variants_without_qn_or_codecs() {
+        let text = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS=\"avc1.640032,mp4a.40.2\"\n",
+            "https://a.example.com/index.m3u8?cdn=cn-gotcha01\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=4000000,BILI-QN=10000\n",
+            "https://b.example.com/index.m3u8?cdn=cn-gotcha02\n",
+        );
+        assert!(parse_master_m3u8(text).is_none());
+    }
+
+    #[test]
+    fn parse_master_m3u8_dedups_same_qn_and_cdn() {
+        let text = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:CODECS=\"avc1.640032\",BILI-QN=10000\n",
+            "https://a.example.com/index.m3u8?cdn=cn-gotcha01\n",
+            "#EXT-X-STREAM-INF:CODECS=\"avc1.640032\",BILI-QN=10000\n",
+            "https://b.example.com/index.m3u8?cdn=cn-gotcha01\n",
+        );
+        let candidates = parse_master_m3u8(text).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].url.starts_with("https://a.example.com/"));
+    }
+
+    /// 头像与房间信息来自同一次 getInfoByRoom 响应，字段缺失时留空而不是报错
+    #[test]
+    fn room_profile_takes_cover_and_anchor_face_from_one_response() {
+        let response = serde_json::json!({
+            "code": 0,
+            "data": {
+                "room_info": {
+                    "room_id": 1, "uid": 2, "live_status": 1, "live_start_time": 3,
+                    "special_type": 0, "title": "t",
+                    "cover": "https://i0.hdslb.com/bfs/live/cover.jpg"
+                },
+                "anchor_info": {
+                    "base_info": { "face": "https://i1.hdslb.com/bfs/face/face.jpg" }
+                }
+            }
+        });
+        let profile = parse_room_profile(&response).unwrap().unwrap();
+        assert_eq!(profile.cover, "https://i0.hdslb.com/bfs/live/cover.jpg");
+        assert_eq!(profile.avatar, "https://i1.hdslb.com/bfs/face/face.jpg");
+
+        let without_anchor = serde_json::json!({
+            "code": 0,
+            "data": { "room_info": { "room_id": 1, "live_status": 1, "title": "t" } }
+        });
+        let profile = parse_room_profile(&without_anchor).unwrap().unwrap();
+        assert_eq!(profile.avatar, "");
+
+        let offline = serde_json::json!({
+            "code": 0,
+            "data": { "room_info": { "room_id": 1, "live_status": 0 } }
+        });
+        assert!(parse_room_profile(&offline).unwrap().is_none());
+    }
 }

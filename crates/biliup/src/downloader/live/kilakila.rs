@@ -96,6 +96,7 @@ impl KilakilaLive {
                 title: response.b.title.unwrap_or(room_id),
                 date: Utc::now(),
                 live_cover_url: response.b.cover_url.unwrap_or_default(),
+                avatar_url: None,
                 suffix: media_ext_from_url(&raw_stream_url).unwrap_or_else(|| {
                     if self.protocol == "flv" {
                         "flv".to_string()
@@ -153,6 +154,6 @@ struct KilakilaBody {
     #[serde(rename = "hlsPlayUrl")]
     hls_play_url: Option<String>,
     title: Option<String>,
-    #[serde(rename = "coverUrl")]
+    #[serde(rename = "coverUrl", alias = "backPic")]
     cover_url: Option<String>,
 }

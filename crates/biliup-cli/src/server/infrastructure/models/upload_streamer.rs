@@ -15,6 +15,8 @@ pub struct UploadStreamer {
     pub title: Option<String>,
     /// 分区ID
     pub tid: Option<u16>,
+    /// 新版分区ID (tid_v2)
+    pub tid_v2: Option<u32>,
     /// 版权类型（1-自制，2-转载）
     pub copyright: Option<u8>,
     /// 转载来源
@@ -65,6 +67,7 @@ pub struct InsertUploadStreamer {
     pub template_name: String,
     pub title: Option<String>,
     pub tid: Option<u16>,
+    pub tid_v2: Option<u32>,
     pub copyright: Option<u8>,
     pub copyright_source: Option<String>,
     pub cover_path: Option<String>,
@@ -85,4 +88,40 @@ pub struct InsertUploadStreamer {
     pub up_close_danmu: Option<u8>,
     pub extra_fields: Option<String>,
     pub is_only_self: Option<u8>,
+}
+
+pub(crate) fn is_noop_uploader(uploader: Option<&str>) -> bool {
+    uploader
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("noop"))
+}
+
+impl UploadStreamer {
+    pub(crate) fn is_noop_uploader(&self) -> bool {
+        is_noop_uploader(self.uploader.as_deref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_noop_uploader;
+
+    #[test]
+    fn noop_uploader_matches_case_insensitively() {
+        assert!(is_noop_uploader(Some("Noop")));
+        assert!(is_noop_uploader(Some("noop")));
+        assert!(is_noop_uploader(Some("NOOP")));
+    }
+
+    #[test]
+    fn noop_uploader_ignores_surrounding_whitespace() {
+        assert!(is_noop_uploader(Some("  Noop  ")));
+    }
+
+    #[test]
+    fn noop_uploader_rejects_missing_or_other_uploaders() {
+        assert!(!is_noop_uploader(None));
+        assert!(!is_noop_uploader(Some("")));
+        assert!(!is_noop_uploader(Some("biliup-rs")));
+    }
 }
