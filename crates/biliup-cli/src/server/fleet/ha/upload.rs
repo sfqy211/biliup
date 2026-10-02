@@ -507,8 +507,15 @@ impl Session {
         recorder.filename_prefix = upload_config.title.clone();
         match self {
             Session::Real(context) => {
-                let studio =
-                    build_studio(upload_config, &context.bilibili, videos, &recorder).await?;
+                let studio = build_studio(
+                    upload_config,
+                    &context.bilibili,
+                    videos,
+                    &recorder,
+                    ctx.downloaded_cover_path()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                )
+                .await?;
                 let submit_api = ctx.config().submit_api.clone();
                 let ret =
                     submit_to_bilibili(&context.bilibili, &studio, submit_api.as_deref()).await?;
